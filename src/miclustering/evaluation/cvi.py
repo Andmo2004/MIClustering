@@ -499,6 +499,196 @@ class IIndex(BaseCVI):
         return ((1.0 / k) * (e1 / ek) * dk) ** self._P
 
 
+class DunnIndex(BaseCVI):
+    """
+    Índice Dunn (DI) — ↑ mejor.
+
+    Mide la relación entre la mínima distancia inter-cluster y el máximo
+    diámetro intra-cluster. Un DI alto indica clusters compactos y bien
+    separados.
+
+    Fórmula (Tabla 4.2, ec. 16):
+        DI = min_{j} min_{j'≠j}  η(Cj, Cj') / max_{j''} δ(Cj'')
+
+    Donde:
+      η(Cj, Cj') = min{ D(xi, xi') | xi ∈ Cj, xi' ∈ Cj' }
+                   Mínima distancia entre cualquier par de puntos de
+                   clusters distintos (single-linkage inter-cluster).
+      δ(Cj'')    = max{ D(xi, xi') | xi, xi' ∈ Cj'' }
+                   Diámetro del cluster (máxima distancia intra-cluster).
+
+    Propiedades:
+      - Se calcula directamente sobre la matriz de distancias N×N.
+      - No requiere X (centroides de bolsas).
+      - Los puntos de ruido (-1) se excluyen.
+      - Clusters singleton tienen diámetro 0 (un solo punto).
+      - Si max_diameter = 0 (todos singletons), devuelve inf
+        (separación perfecta sin extensión interna).
+      - Se necesitan al menos 2 clusters reales.
+
+    Ref: Dunn (1974); Gomez-Flores (tesis), ec. (16).
+    """
+
+    @property
+    def name(self) -> str:
+        return "DI"
+
+    @property
+    def category(self) -> str:
+        return "compactness_separation"
+
+    def compute(
+        self,
+        dist_matrix: np.ndarray,
+        labels: Dict[str, int],
+        bag_ids: List[str],
+        X: Optional[np.ndarray] = None,   # no se usa, firma uniforme
+    ) -> float:
+        label_arr = self._label_array(labels, bag_ids)
+        clusters  = self._real_clusters(label_arr)
+        k         = len(clusters)
+
+        if k < 2:
+            logger.warning("[DI] Se necesitan al menos 2 clusters.")
+            return 0.0
+
+        # --- Diámetros intra-cluster: δ(Cj) = max D(xi, xi') para xi, xi' ∈ Cj ---
+        diameters = np.zeros(k, dtype=np.float64)
+        cluster_indices: List[np.ndarray] = []
+
+        for i, cid in enumerate(clusters):
+            idx = self._cluster_idx(label_arr, int(cid))
+            cluster_indices.append(idx)
+            if len(idx) < 2:
+                diameters[i] = 0.0
+            else:
+                # Sub-matriz de distancias intra-cluster
+                sub = dist_matrix[np.ix_(idx, idx)]
+                diameters[i] = float(sub.max())
+
+        max_diameter = float(diameters.max())
+
+        if max_diameter < 1e-15:
+            # Todos los clusters son singletons → diámetro 0
+            # Separación perfecta relativa; devolver inf
+            return float("inf")
+
+        # --- Mínima distancia inter-cluster: η(Cj, Cj') ---
+        min_ratio = float("inf")
+
+        for a in range(k):
+            idx_a = cluster_indices[a]
+            for b in range(a + 1, k):
+                idx_b = cluster_indices[b]
+                # Mínima distancia entre pares de puntos de clusters distintos
+                inter_sub = dist_matrix[np.ix_(idx_a, idx_b)]
+                eta = float(inter_sub.min())
+                ratio = eta / max_diameter
+                if ratio < min_ratio:
+                    min_ratio = ratio
+
+        return min_ratio
+
+
+class SilhouetteIndex(BaseCVI):
+    """
+    Índice Silhouette (S) — ↑ mejor.
+
+    Proporciona un promedio de la desigualdad entre las instancias dentro
+    de su cluster contra el cluster más cercano. Valores cercanos a 1
+    indican clusters compactos y bien separados.
+
+    Fórmula (ec. 13):
+        Para xi ∈ Cj:
+          a(xi) = Σ_{xi' ∈ Cj} D(xi, xi') / |Cj|
+          b(xi) = min{ D(xi, xi'') | xi'' ∈ Cj'', Cj ≠ Cj'' }
+          s(xi) = (b(xi) - a(xi)) / max{a(xi), b(xi)}
+
+        S = (1/n) · Σ s(xi)   ∈ [-1, 1]
+
+    Propiedades:
+      - Se calcula directamente sobre la matriz de distancias N×N.
+      - No requiere X (centroides de bolsas).
+      - Los puntos de ruido (-1) se excluyen.
+      - Singletons: a(xi)=0, s(xi)=1 si b>0 (perfectamente compacto).
+      - Se necesitan al menos 2 clusters reales.
+
+    Ref: Rousseeuw (1987); Gomez-Flores (tesis), ec. (13).
+    """
+
+    @property
+    def name(self) -> str:
+        return "S"
+
+    @property
+    def category(self) -> str:
+        return "compactness_separation"
+
+    def compute(
+        self,
+        dist_matrix: np.ndarray,
+        labels: Dict[str, int],
+        bag_ids: List[str],
+        X: Optional[np.ndarray] = None,   # no se usa, firma uniforme
+    ) -> float:
+        label_arr = self._label_array(labels, bag_ids)
+        clusters  = self._real_clusters(label_arr)
+        k         = len(clusters)
+
+        if k < 2:
+            logger.warning("[S] Se necesitan al menos 2 clusters.")
+            return 0.0
+
+        # Máscara de puntos válidos (no ruido)
+        valid_mask = label_arr >= 0
+        valid_idx  = np.where(valid_mask)[0]
+        n_valid    = len(valid_idx)
+
+        if n_valid == 0:
+            return 0.0
+
+        # Pre-calcular índices por cluster
+        cluster_members: Dict[int, np.ndarray] = {}
+        for cid in clusters:
+            cluster_members[int(cid)] = self._cluster_idx(label_arr, int(cid))
+
+        # Índices de todos los puntos que NO pertenecen a cada cluster
+        # (para calcular b(xi) eficientemente)
+        other_idx: Dict[int, np.ndarray] = {}
+        for cid in clusters:
+            cid_int = int(cid)
+            # Puntos válidos que no están en este cluster
+            mask = valid_mask.copy()
+            mask[cluster_members[cid_int]] = False
+            other_idx[cid_int] = np.where(mask)[0]
+
+        s_values = np.zeros(n_valid, dtype=np.float64)
+
+        for pos, i in enumerate(valid_idx):
+            cid_i  = int(label_arr[i])
+            members = cluster_members[cid_i]
+
+            # a(xi): promedio de distancias a puntos del mismo cluster
+            #        (incluye D(xi,xi)=0; divide por |Cj| según la fórmula)
+            a_i = float(dist_matrix[i, members].mean())
+
+            # b(xi): mínima distancia a cualquier punto de otro cluster
+            others = other_idx[cid_i]
+            if len(others) == 0:
+                # No hay otros clusters con puntos (no debería ocurrir con k>=2)
+                b_i = 0.0
+            else:
+                b_i = float(dist_matrix[i, others].min())
+
+            denom = max(a_i, b_i)
+            if denom < 1e-15:
+                s_values[pos] = 0.0
+            else:
+                s_values[pos] = (b_i - a_i) / denom
+
+        return float(s_values.mean())
+
+
 # 
 # Evaluador Unificado de CVIs Internos
 # 
@@ -524,6 +714,10 @@ class InternalCVIEvaluator:
         SEDIndex(),
         DDIndex(),
         HcIndex(),
+        VRCIndex(),
+        IIndex(),
+        DunnIndex(),
+        SilhouetteIndex(),
     ]
  
     def __init__(self, cvis: Optional[List[BaseCVI]] = None) -> None:
