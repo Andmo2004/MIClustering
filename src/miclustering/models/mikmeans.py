@@ -8,6 +8,11 @@ from miclustering.data.midata import MIData
 from miclustering.data.bag import Bag
 from miclustering.data.instance import Instance
 from miclustering.distances import DISTANCE_REGISTRY
+from miclustering.distances.bag_centroid_vectorized import (
+    compute_bag_centroid_matrix,
+    precompute_bag_cache,
+    BagCentroidCache,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +132,7 @@ class MIKMeans(BaseEstimator, ClusterMixin):
         self._fitted = False
         self._train_bags = []
         self._centroids = []
+        self._bag_cache = None
 
     def _get_metric_function(self, name: str) -> Callable[[Bag, Bag], float]:
         if name not in DISTANCE_REGISTRY:
@@ -137,7 +143,8 @@ class MIKMeans(BaseEstimator, ClusterMixin):
 
     def _array_to_bag(self, centroid: np.ndarray, cluster_id: int) -> Bag:
         """Envuelve un vector centroide en un Bag sintético de una instancia."""
-        schema = self._train_bags[0][0].schema   # reutiliza el schema del dataset
+        schema_raw = next((b[0].schema for b in self._train_bags if len(b) > 0), None)
+        schema = schema_raw if schema_raw is not None else []
         c_mat = np.ascontiguousarray(centroid.reshape(1, -1), dtype=np.float64)
         instance = Instance(c_mat[0].tolist(), schema)
         bag = Bag(bag_id=f"__centroid_{cluster_id}__", label=-1, instances=[instance])
@@ -182,6 +189,9 @@ class MIKMeans(BaseEstimator, ClusterMixin):
         self._train_bags = dataset.bags
         num_bags = len(self._train_bags)
 
+        # Precomputación O(N) una sola vez: estructuras vectorizadas según la métrica
+        self._bag_cache = precompute_bag_cache(self._train_bags, self._metric_name)
+
         # Inicialización de centroides (elegimos k bolsas aleatorias inicialmente)
         rng = np.random.RandomState(self._random_state)
         initial_indices = rng.choice(num_bags, self._k, replace=False).tolist()
@@ -198,19 +208,22 @@ class MIKMeans(BaseEstimator, ClusterMixin):
             centroid_bag = self._calculate_centroid([bag], c_idx)
             self._centroids.append(centroid_bag)
         
-        cluster_assignments = np.zeros(num_bags, dtype=int)
+        cluster_assignments = np.full(num_bags, -1, dtype=int)
         prev_assignments = None
         prev_prev_assignments = None
         
         logger.info(f"Iniciando MIKMeans (k={self._k}, max_iters={self._max_iters}, tol={self._tol})...")
 
         for iteration in range(self._max_iters):
-            new_assignments = np.zeros(num_bags, dtype=int)
-            
-            # 1. Asignar cada bolsa al centroide más cercano
-            for i, bag in enumerate(self._train_bags):
-                distances = [self._metric_func(bag, centroid) for centroid in self._centroids]
-                new_assignments[i] = np.argmin(distances)
+            # 1. Asignar cada bolsa al centroide más cercano (matriz N x K vectorizada)
+            distance_matrix = compute_bag_centroid_matrix(
+                self._train_bags,
+                self._centroids,
+                self._metric_name,
+                self._metric_func,
+                bag_cache=self._bag_cache,
+            )
+            new_assignments = np.argmin(distance_matrix, axis=1)
                 
             # Comprobar convergencia
             n_changed = int(np.sum(cluster_assignments != new_assignments))
@@ -241,6 +254,7 @@ class MIKMeans(BaseEstimator, ClusterMixin):
             
             # 2. Actualizar centroides
             new_centroids = []
+            used_indices = set()
             for c in range(self._k):
                 cluster_points = np.where(cluster_assignments == c)[0]
                 cluster_bags = [self._train_bags[idx] for idx in cluster_points] if len(cluster_points) > 0 else []
@@ -250,8 +264,22 @@ class MIKMeans(BaseEstimator, ClusterMixin):
                     # Clúster vacío o sin instancias válidas: reinicializar con el punto más alejado del centroide global
                     logger.debug(f"Clúster {c} vacío o sin instancias en iteración {iteration}. Reinicializando centroide.")
                     global_centroid = self._calculate_centroid(self._train_bags, -1)
-                    distances_to_global = [self._metric_func(bag, global_centroid) for bag in self._train_bags]
-                    farthest_idx = int(np.argmax(distances_to_global))
+                    distances_to_global = compute_bag_centroid_matrix(
+                        self._train_bags,
+                        [global_centroid],
+                        self._metric_name,
+                        self._metric_func,
+                        bag_cache=self._bag_cache,
+                    )[:, 0]
+                    sorted_indices = np.argsort(distances_to_global)[::-1]
+                    farthest_idx = None
+                    for s_idx in sorted_indices:
+                        if int(s_idx) not in used_indices:
+                            farthest_idx = int(s_idx)
+                            break
+                    if farthest_idx is None:
+                        farthest_idx = int(sorted_indices[0])
+                    used_indices.add(farthest_idx)
                     new_centroids.append(self._calculate_centroid([self._train_bags[farthest_idx]], c))
                     continue
                     
@@ -279,11 +307,16 @@ class MIKMeans(BaseEstimator, ClusterMixin):
 
         logger.info(f"Prediciendo {test_dataset.get_num_bags()} bolsas de prueba...")
 
-        test_labels = {}
-        for test_bag in test_dataset.bags:
-            distances = [self._metric_func(test_bag, centroid) for centroid in self._centroids]
-            # Convertimos np.int64 a int nativo de Python
-            test_labels[test_bag.bag_id] = int(np.argmin(distances))
+        distance_matrix = compute_bag_centroid_matrix(
+            test_dataset.bags,
+            self._centroids,
+            self._metric_name,
+            self._metric_func,
+        )
+        assignments = np.argmin(distance_matrix, axis=1)
+        test_labels = {
+            bag.bag_id: int(a) for bag, a in zip(test_dataset.bags, assignments)
+        }
             
         return test_labels
 
